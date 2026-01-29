@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useEffect, Suspense } from "react";
 import { TopBar } from "@/components/TopBar";
 import {
     Search,
@@ -39,7 +39,7 @@ interface CartItem {
     maxQty: number; // Total packs available for this batch
 }
 
-export default function SellPage() {
+function SellPageContent() {
     const supabase = createClient();
     const [isLoading, setIsLoading] = useState(true);
     const [isSubmitting, setIsSubmitting] = useState(false);
@@ -768,5 +768,17 @@ export default function SellPage() {
                 )}
             </AnimatePresence>
         </div>
+    );
+}
+
+export default function SellPage() {
+    return (
+        <Suspense fallback={
+            <div className="min-h-screen bg-[#FDFDFF] flex items-center justify-center">
+                <Loader2 className="w-8 h-8 animate-spin text-indigo-600" />
+            </div>
+        }>
+            <SellPageContent />
+        </Suspense>
     );
 }

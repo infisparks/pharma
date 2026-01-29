@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useEffect, Suspense } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
     ChevronRight,
@@ -39,7 +39,7 @@ interface PurchaseItem {
     unitType: string;
 }
 
-export default function PurchaseEntry() {
+function PurchaseEntryContent() {
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [isSuccess, setIsSuccess] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
@@ -725,5 +725,17 @@ export default function PurchaseEntry() {
                 </div>
             </main>
         </div>
+    );
+}
+
+export default function PurchaseEntry() {
+    return (
+        <Suspense fallback={
+            <div className="min-h-screen bg-[#FDFDFF] flex items-center justify-center">
+                <Loader2 className="w-8 h-8 animate-spin text-indigo-600" />
+            </div>
+        }>
+            <PurchaseEntryContent />
+        </Suspense>
     );
 }
