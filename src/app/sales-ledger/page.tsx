@@ -28,11 +28,14 @@ import {
     Banknote,
     Percent,
     Hash,
-    Loader2
+    Loader2,
+    Pencil,
+    Trash2
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { createClient } from "@/utils/supabase/client";
+import Link from "next/link";
 
 interface SaleItem {
     productName: string;
@@ -40,6 +43,8 @@ interface SaleItem {
     quantity: number;
     unitPrice: number;
     mrp: number;
+    purchasePrice: number;
+    profit: number;
     expiryDate: string;
     lineTotal: number;
 }
@@ -57,11 +62,15 @@ interface SaleRecord {
     grandTotal: number;
     amountPaid: number;
     amountDue: number;
+    cashAmount: number;
+    onlineAmount: number;
     paymentStatus: 'Paid' | 'Unpaid' | 'Partial';
     paymentMethod: 'Cash' | 'Online' | 'Mixed';
     soldBy: string;
     status: string;
     notes: string;
+    profit: number;
+    totalPurchasePrice: number;
     items: SaleItem[];
 }
 
@@ -73,14 +82,16 @@ export default function SalesLedgerPage() {
     const [expandedId, setExpandedId] = useState<number | null>(null);
     const [filterStatus, setFilterStatus] = useState<'All' | 'Paid' | 'Unpaid' | 'Partial'>('All');
     const [filterPayment, setFilterPayment] = useState<'All' | 'Cash' | 'Online' | 'Mixed'>('All');
+    const [startDate, setStartDate] = useState(new Date().toISOString().split('T')[0]);
+    const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0]);
 
     useEffect(() => {
         loadSales();
-    }, []);
+    }, [startDate, endDate]);
 
     const loadSales = async () => {
         setIsLoading(true);
-        const { data: salesData } = await supabase
+        let query = supabase
             .from('sales')
             .select(`
                 *,
@@ -95,20 +106,54 @@ export default function SalesLedgerPage() {
                         emoji
                     )
                 )
-            `)
-            .order('sale_date', { ascending: false });
+            `);
+
+        if (startDate) {
+            query = query.gte('sale_date', `${startDate}T00:00:00`);
+        }
+        if (endDate) {
+            query = query.lte('sale_date', `${endDate}T23:59:59`);
+        }
+
+        const { data: salesData } = await query.order('sale_date', { ascending: false });
 
         if (salesData) {
-            // Fetch batch info from purchase_items to get expiry and original MRP
+            // Fetch batch info from purchase_items to get expiry, original MRP, and purchase price for profit
             const { data: purchaseData } = await supabase
                 .from('purchase_items')
-                .select('product_id, batch_code, expiry_date, mrp');
+                .select('product_id, batch_code, expiry_date, mrp, purchase_price');
 
             const mappedSales: SaleRecord[] = salesData.map(sale => {
-                const totalPaid = (parseFloat(sale.cash_amount) || 0) + (parseFloat(sale.online_amount) || 0);
+                const cashAmount = parseFloat(sale.cash_amount) || 0;
+                const onlineAmount = parseFloat(sale.online_amount) || 0;
+                const totalPaid = cashAmount + onlineAmount;
                 const grandTotal = parseFloat(sale.total_amount) || 0;
                 const discountAmount = parseFloat(sale.discount_amount) || 0;
                 const amountDue = Math.max(0, grandTotal - totalPaid);
+
+                let totalSaleProfit = 0;
+                let totalPurchasePrice = 0;
+                const mappedItems = sale.sale_items?.map((item: any) => {
+                    const pInfo = purchaseData?.find(pd => pd.product_id === item.product_id && pd.batch_code === item.batch_code);
+                    const purchasePrice = pInfo?.purchase_price || 0;
+                    const quantity = parseFloat(item.quantity) || 0;
+                    const unitPrice = parseFloat(item.unit_price) || 0;
+                    const itemProfit = (unitPrice - purchasePrice) * quantity;
+                    totalSaleProfit += itemProfit;
+                    totalPurchasePrice += purchasePrice * quantity;
+
+                    return {
+                        productName: item.products?.name || 'Unknown',
+                        batchCode: item.batch_code || 'N/A',
+                        quantity: quantity,
+                        unitPrice: unitPrice,
+                        lineTotal: parseFloat(item.subtotal) || 0,
+                        mrp: pInfo?.mrp || item.unit_price,
+                        purchasePrice: purchasePrice,
+                        profit: itemProfit,
+                        expiryDate: pInfo?.expiry_date ? new Date(pInfo.expiry_date).toLocaleDateString('en-GB') : 'N/A'
+                    };
+                }) || [];
 
                 return {
                     id: sale.id,
@@ -123,28 +168,50 @@ export default function SalesLedgerPage() {
                     subtotal: grandTotal + discountAmount,
                     amountPaid: totalPaid,
                     amountDue: amountDue,
+                    cashAmount: cashAmount,
+                    onlineAmount: onlineAmount,
                     paymentStatus: amountDue <= 0.01 ? 'Paid' : (totalPaid > 0 ? 'Partial' : 'Unpaid'),
                     paymentMethod: sale.payment_method,
                     soldBy: 'Administrator',
                     status: sale.status,
                     notes: sale.notes || '',
-                    items: sale.sale_items?.map((item: any) => {
-                        const pInfo = purchaseData?.find(pd => pd.product_id === item.product_id && pd.batch_code === item.batch_code);
-                        return {
-                            productName: item.products?.name || 'Unknown',
-                            batchCode: item.batch_code || 'N/A',
-                            quantity: parseFloat(item.quantity) || 0,
-                            unitPrice: parseFloat(item.unit_price) || 0,
-                            lineTotal: parseFloat(item.subtotal) || 0,
-                            mrp: pInfo?.mrp || item.unit_price,
-                            expiryDate: pInfo?.expiry_date ? new Date(pInfo.expiry_date).toLocaleDateString('en-GB') : 'N/A'
-                        };
-                    }) || []
+                    profit: totalSaleProfit - discountAmount,
+                    totalPurchasePrice: totalPurchasePrice,
+                    items: mappedItems
                 };
             });
             setSalesRecords(mappedSales);
         }
         setIsLoading(false);
+    };
+
+    const handleDelete = async (saleId: number) => {
+        if (!confirm("Are you sure you want to delete this sale? This action cannot be undone.")) return;
+
+        try {
+            // sale_items will be deleted automatically if CASCADE is set, 
+            // but let's be explicit if not sure, or just delete the header.
+            // Stock is calculated in real-time from sale_items, so deleting them is enough.
+
+            const { error: itemsErr } = await supabase
+                .from('sale_items')
+                .delete()
+                .eq('sale_id', saleId);
+
+            if (itemsErr) throw itemsErr;
+
+            const { error: saleErr } = await supabase
+                .from('sales')
+                .delete()
+                .eq('id', saleId);
+
+            if (saleErr) throw saleErr;
+
+            setSalesRecords(prev => prev.filter(r => r.id !== saleId));
+            alert("Sale deleted successfully.");
+        } catch (err: any) {
+            alert("Error deleting sale: " + err.message);
+        }
     };
 
     const filteredRecords = useMemo(() => {
@@ -162,14 +229,46 @@ export default function SalesLedgerPage() {
     }, [searchQuery, filterStatus, filterPayment, salesRecords]);
 
     const stats = useMemo(() => {
-        if (salesRecords.length === 0) return { totalSales: 0, totalPaid: 0, totalDue: 0, totalTransactions: 0 };
-        const totalSales = salesRecords.reduce((acc, r) => acc + r.grandTotal, 0);
-        const totalPaid = salesRecords.reduce((acc, r) => acc + r.amountPaid, 0);
-        const totalDue = salesRecords.reduce((acc, r) => acc + r.amountDue, 0);
-        const totalTransactions = salesRecords.length;
+        const initialStats = {
+            totalSales: 0,
+            totalPaid: 0,
+            totalDue: 0,
+            totalProfit: 0,
+            totalTransactions: filteredRecords.length,
+            cashSales: 0,
+            onlineSales: 0,
+            mixedSales: 0,
+            cashCollected: 0,
+            onlineCollected: 0,
+            cashProfit: 0,
+            onlineProfit: 0,
+            mixedProfit: 0
+        };
 
-        return { totalSales, totalPaid, totalDue, totalTransactions };
-    }, [salesRecords]);
+        if (filteredRecords.length === 0) return initialStats;
+
+        return filteredRecords.reduce((acc, r) => {
+            acc.totalSales += r.grandTotal;
+            acc.totalPaid += r.amountPaid;
+            acc.totalDue += r.amountDue;
+            acc.totalProfit += r.profit;
+            acc.cashCollected += r.cashAmount;
+            acc.onlineCollected += r.onlineAmount;
+
+            if (r.paymentMethod === 'Cash') {
+                acc.cashSales += r.grandTotal;
+                acc.cashProfit += r.profit;
+            } else if (r.paymentMethod === 'Online') {
+                acc.onlineSales += r.grandTotal;
+                acc.onlineProfit += r.profit;
+            } else if (r.paymentMethod === 'Mixed') {
+                acc.mixedSales += r.grandTotal;
+                acc.mixedProfit += r.profit;
+            }
+
+            return acc;
+        }, initialStats);
+    }, [filteredRecords]);
 
     const getStatusColor = (status: string) => {
         switch (status) {
@@ -224,41 +323,42 @@ export default function SalesLedgerPage() {
                     </div>
 
                     {/* Stats Grid */}
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
-                        <motion.div
-                            initial={{ opacity: 0, y: 10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-md transition-all"
-                        >
-                            <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-                                <TrendingUp size={40} strokeWidth={3} />
-                            </div>
-                            <div className="relative z-10 text-center">
-                                <div className="flex items-center justify-center gap-2 mb-1">
-                                    <BarChart3 size={14} className="text-indigo-600" strokeWidth={3} />
-                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-[2px]">Total Sales</span>
-                                </div>
-                                <div className="text-xl font-black text-gray-800 tabular-nums leading-none">Rs.{stats.totalSales.toFixed(2)}</div>
-                                <div className="text-[10px] font-bold text-gray-400 mt-1 uppercase tracking-tighter">{stats.totalTransactions} Orders</div>
-                            </div>
-                        </motion.div>
-
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
                         <motion.div
                             initial={{ opacity: 0, y: 10 }}
                             animate={{ opacity: 1, y: 0 }}
                             transition={{ delay: 0.1 }}
-                            className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-md transition-all"
+                            className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-md transition-all border-b-4 border-b-emerald-500"
                         >
                             <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
                                 <CheckCircle2 size={40} strokeWidth={3} />
                             </div>
-                            <div className="relative z-10 text-center">
-                                <div className="flex items-center justify-center gap-2 mb-1">
-                                    <CheckCircle2 size={14} className="text-emerald-600" strokeWidth={3} />
-                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-[2px]">Collected</span>
+                            <div className="relative z-10">
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2">
+                                        <CheckCircle2 size={14} className="text-emerald-600" strokeWidth={3} />
+                                        <span className="text-[10px] font-black text-gray-400 uppercase tracking-[2px]">Total Collected</span>
+                                    </div>
+                                    <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full">
+                                        {stats.totalTransactions} Orders
+                                    </span>
                                 </div>
-                                <div className="text-xl font-black text-emerald-600 tabular-nums leading-none">Rs.{stats.totalPaid.toFixed(2)}</div>
-                                <div className="text-[10px] font-bold text-gray-400 mt-1 uppercase tracking-tighter">{stats.totalSales > 0 ? Math.round((stats.totalPaid / stats.totalSales) * 100) : 0}% Comp.</div>
+                                <div className="text-2xl font-black text-emerald-600 tabular-nums leading-none mb-4">Rs.{stats.totalPaid.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+
+                                <div className="grid grid-cols-3 gap-2 pt-3 border-t border-gray-50">
+                                    <div>
+                                        <div className="text-[9px] font-black text-gray-400 uppercase tracking-tighter">Cash</div>
+                                        <div className="text-[11px] font-bold text-gray-700 tabular-nums">{stats.cashCollected.toLocaleString()}</div>
+                                    </div>
+                                    <div>
+                                        <div className="text-[9px] font-black text-gray-400 uppercase tracking-tighter">Online</div>
+                                        <div className="text-[11px] font-bold text-gray-700 tabular-nums">{stats.onlineCollected.toLocaleString()}</div>
+                                    </div>
+                                    <div className="text-right">
+                                        <div className="text-[9px] font-black text-red-400 uppercase tracking-tighter">Due</div>
+                                        <div className="text-[11px] font-bold text-red-600 tabular-nums">{stats.totalDue.toLocaleString()}</div>
+                                    </div>
+                                </div>
                             </div>
                         </motion.div>
 
@@ -266,76 +366,85 @@ export default function SalesLedgerPage() {
                             initial={{ opacity: 0, y: 10 }}
                             animate={{ opacity: 1, y: 0 }}
                             transition={{ delay: 0.2 }}
-                            className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-md transition-all"
+                            className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-md transition-all border-b-4 border-b-purple-500"
                         >
                             <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-                                <AlertCircle size={40} strokeWidth={3} />
+                                <DollarSign size={40} strokeWidth={3} />
                             </div>
-                            <div className="relative z-10 text-center">
-                                <div className="flex items-center justify-center gap-2 mb-1">
-                                    <XCircle size={14} className="text-red-500" strokeWidth={3} />
-                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-[2px]">Outstanding</span>
+                            <div className="relative z-10">
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2">
+                                        <Percent size={14} className="text-purple-600" strokeWidth={3} />
+                                        <span className="text-[10px] font-black text-gray-400 uppercase tracking-[2px]">Total Profit</span>
+                                    </div>
+                                    <span className="text-[10px] font-bold text-purple-600 bg-purple-50 px-2 py-0.5 rounded-full">
+                                        {stats.totalSales > 0 ? Math.round((stats.totalProfit / stats.totalSales) * 100) : 0}% Margin
+                                    </span>
                                 </div>
-                                <div className="text-xl font-black text-red-600 tabular-nums leading-none">Rs.{stats.totalDue.toFixed(2)}</div>
-                                <div className="text-[10px] font-bold text-gray-400 mt-1 uppercase tracking-tighter">Debit Bal.</div>
-                            </div>
-                        </motion.div>
+                                <div className="text-2xl font-black text-purple-600 tabular-nums leading-none mb-4">Rs.{stats.totalProfit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
 
-                        <motion.div
-                            initial={{ opacity: 0, y: 10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            transition={{ delay: 0.3 }}
-                            className="bg-white rounded-xl p-4 border border-gray-100 shadow-sm relative overflow-hidden group hover:shadow-md transition-all"
-                        >
-                            <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-                                <ShoppingBag size={40} strokeWidth={3} />
-                            </div>
-                            <div className="relative z-10 text-center">
-                                <div className="flex items-center justify-center gap-2 mb-1">
-                                    <ShoppingBag size={14} className="text-purple-600" strokeWidth={3} />
-                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-[2px]">Avg. Order</span>
+                                <div className="pt-3 border-t border-gray-50">
+                                    <div className="text-[10px] font-bold text-gray-400 uppercase tracking-tight">Net earnings after discounts</div>
                                 </div>
-                                <div className="text-xl font-black text-purple-600 tabular-nums leading-none">Rs.{stats.totalTransactions > 0 ? (stats.totalSales / stats.totalTransactions).toFixed(2) : '0.00'}</div>
-                                <div className="text-[10px] font-bold text-gray-400 mt-1 uppercase tracking-tighter">Per Bill</div>
                             </div>
                         </motion.div>
                     </div>
 
                     {/* Search and Filters */}
                     <div className="bg-white rounded-xl p-3 border border-gray-100 shadow-sm mb-4">
-                        <div className="flex flex-col lg:flex-row gap-3">
+                        <div className="flex flex-col lg:flex-row gap-4">
                             {/* Search */}
-                            <div className="flex-1 relative">
+                            <div className="flex-[2] relative">
                                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={14} />
                                 <input
                                     type="text"
                                     placeholder="Search Customer, Invoice..."
                                     value={searchQuery}
                                     onChange={(e) => setSearchQuery(e.target.value)}
-                                    className="w-full pl-9 pr-3 h-9 bg-gray-50 border border-gray-100 rounded-lg text-[13px] font-bold text-gray-900 placeholder:text-gray-400 focus:bg-white transition-all shadow-inner"
+                                    className="w-full pl-9 pr-3 h-10 bg-gray-50 border border-gray-100 rounded-lg text-xs font-bold text-gray-900 placeholder:text-gray-400 focus:bg-white transition-all shadow-inner"
                                 />
                             </div>
 
-                            {/* Status Filter */}
-                            <div className="flex items-center gap-2">
+                            {/* Date Filter */}
+                            <div className="flex-1 flex items-center gap-2">
+                                <div className="relative flex-1">
+                                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={12} />
+                                    <input
+                                        type="date"
+                                        value={startDate}
+                                        onChange={(e) => setStartDate(e.target.value)}
+                                        className="w-full pl-9 pr-2 h-10 bg-gray-50 border border-gray-100 rounded-lg text-[10px] font-black text-gray-600 uppercase focus:bg-white transition-all outline-none"
+                                    />
+                                </div>
+                                <span className="text-gray-300 font-bold text-xs">to</span>
+                                <div className="relative flex-1">
+                                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={12} />
+                                    <input
+                                        type="date"
+                                        value={endDate}
+                                        onChange={(e) => setEndDate(e.target.value)}
+                                        className="w-full pl-9 pr-2 h-10 bg-gray-50 border border-gray-100 rounded-lg text-[10px] font-black text-gray-600 uppercase focus:bg-white transition-all outline-none"
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Status and Payment Filters */}
+                            <div className="flex gap-2">
                                 <select
                                     value={filterStatus}
                                     onChange={(e) => setFilterStatus(e.target.value as any)}
-                                    className="px-3 h-9 bg-gray-50 border border-gray-100 rounded-lg text-[11px] font-black text-gray-600 focus:bg-white transition-all cursor-pointer outline-none uppercase tracking-wider"
+                                    className="px-3 h-10 bg-gray-50 border border-gray-100 rounded-lg text-[10px] font-black text-gray-600 focus:bg-white transition-all cursor-pointer outline-none uppercase tracking-wider min-w-[120px]"
                                 >
                                     <option value="All">All Status</option>
                                     <option value="Paid">Paid</option>
                                     <option value="Unpaid">Unpaid</option>
                                     <option value="Partial">Partial</option>
                                 </select>
-                            </div>
 
-                            {/* Payment Method Filter */}
-                            <div className="flex items-center gap-2">
                                 <select
                                     value={filterPayment}
                                     onChange={(e) => setFilterPayment(e.target.value as any)}
-                                    className="px-3 h-9 bg-gray-50 border border-gray-100 rounded-lg text-[11px] font-black text-gray-600 focus:bg-white transition-all cursor-pointer outline-none uppercase tracking-wider"
+                                    className="px-3 h-10 bg-gray-50 border border-gray-100 rounded-lg text-[10px] font-black text-gray-600 focus:bg-white transition-all cursor-pointer outline-none uppercase tracking-wider min-w-[120px]"
                                 >
                                     <option value="All">All Methods</option>
                                     <option value="Cash">Cash</option>
@@ -404,15 +513,31 @@ export default function SalesLedgerPage() {
                                         </div>
 
                                         {/* Right: Financial Summary */}
-                                        <div className="flex items-center gap-6">
-                                            <div className="text-right">
-                                                <div className="text-[14px] font-black text-gray-900 tabular-nums">Rs.{record.grandTotal.toFixed(2)}</div>
-                                                {record.amountDue > 0.01 && (
-                                                    <div className="text-[10px] font-black text-red-500 uppercase tracking-tighter">Due: {record.amountDue.toFixed(2)}</div>
-                                                )}
+                                        <div className="flex items-center gap-4">
+                                            <div className="grid grid-cols-3 gap-6 text-right min-w-[300px]">
+                                                {/* Purchase Price */}
+                                                <div>
+                                                    <div className="text-[9px] font-black text-gray-400 uppercase tracking-tighter">Purchase</div>
+                                                    <div className="text-[14px] font-bold text-gray-500 tabular-nums leading-none">Rs.{record.totalPurchasePrice.toFixed(2)}</div>
+                                                </div>
+
+                                                {/* Amount Taken */}
+                                                <div>
+                                                    <div className="text-[9px] font-black text-emerald-500 uppercase tracking-tighter">Taken</div>
+                                                    <div className="text-[14px] font-black text-emerald-600 tabular-nums leading-none">Rs.{record.amountPaid.toFixed(2)}</div>
+                                                    {record.amountDue > 0.01 && (
+                                                        <div className="text-[8px] font-black text-red-500 uppercase mt-0.5">Due: {record.amountDue.toFixed(2)}</div>
+                                                    )}
+                                                </div>
+
+                                                {/* Profit */}
+                                                <div>
+                                                    <div className="text-[9px] font-black text-purple-500 uppercase tracking-tighter">Profit</div>
+                                                    <div className="text-[14px] font-black text-purple-600 tabular-nums leading-none">Rs.{record.profit.toFixed(2)}</div>
+                                                </div>
                                             </div>
 
-                                            <div className="flex items-center gap-2">
+                                            <div className="flex items-center gap-2 pl-4 border-l border-gray-100">
                                                 <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center",
                                                     record.paymentMethod === 'Cash' ? 'bg-green-50 text-green-600' :
                                                         record.paymentMethod === 'Online' ? 'bg-indigo-50 text-indigo-600' :
@@ -420,6 +545,25 @@ export default function SalesLedgerPage() {
                                                 )}>
                                                     {getPaymentIcon(record.paymentMethod)}
                                                 </div>
+
+                                                <div className="h-4 w-[1px] bg-gray-100 mx-1" />
+
+                                                <Link
+                                                    href={`/sell?type=edit&id=${record.id}`}
+                                                    className="w-8 h-8 rounded-lg bg-gray-50 hover:bg-amber-50 flex items-center justify-center text-gray-400 hover:text-amber-600 transition-all active:scale-95"
+                                                    title="Edit Sale"
+                                                >
+                                                    <Pencil size={14} />
+                                                </Link>
+
+                                                <button
+                                                    onClick={() => handleDelete(record.id)}
+                                                    className="w-8 h-8 rounded-lg bg-gray-50 hover:bg-red-50 flex items-center justify-center text-gray-400 hover:text-red-600 transition-all active:scale-95"
+                                                    title="Delete Sale"
+                                                >
+                                                    <Trash2 size={14} />
+                                                </button>
+
                                                 <button
                                                     onClick={() => setExpandedId(expandedId === record.id ? null : record.id)}
                                                     className="w-8 h-8 rounded-lg bg-gray-50 hover:bg-indigo-50 flex items-center justify-center text-gray-400 hover:text-indigo-600 transition-all active:scale-95"
@@ -457,6 +601,7 @@ export default function SalesLedgerPage() {
                                                                     <th className="text-center p-2.5">Qty</th>
                                                                     <th className="text-right p-2.5">P.Unit</th>
                                                                     <th className="text-right p-2.5">MRP</th>
+                                                                    <th className="text-right p-2.5 text-purple-600">Profit</th>
                                                                     <th className="text-center p-2.5">Expiry</th>
                                                                     <th className="text-right p-2.5">Total</th>
                                                                 </tr>
@@ -480,6 +625,9 @@ export default function SalesLedgerPage() {
                                                                         </td>
                                                                         <td className="p-2.5 text-right">
                                                                             <div className="font-bold text-[10px] text-gray-400 tabular-nums opacity-50">{item.mrp}</div>
+                                                                        </td>
+                                                                        <td className="p-2.5 text-right">
+                                                                            <div className="font-black text-[11px] text-purple-600 tabular-nums">+{item.profit.toFixed(2)}</div>
                                                                         </td>
                                                                         <td className="p-2.5 text-center">
                                                                             <div className="font-bold text-[10px] text-red-500 uppercase tracking-tighter tabular-nums">{item.expiryDate}</div>

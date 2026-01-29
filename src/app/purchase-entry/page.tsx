@@ -22,6 +22,7 @@ import {
     AlertCircle
 } from "lucide-react";
 import Link from "next/link";
+import { useSearchParams, useRouter } from "next/navigation";
 import { cn, disableScrollOnNumberInput } from "@/lib/utils";
 import { createClient } from "@/utils/supabase/client";
 
@@ -43,6 +44,13 @@ export default function PurchaseEntry() {
     const [isSuccess, setIsSuccess] = useState(false);
     const [isLoading, setIsLoading] = useState(true);
     const supabase = createClient();
+    const searchParams = useSearchParams();
+    const router = useRouter();
+    const isEdit = searchParams.get('type') === 'edit';
+    const editId = searchParams.get('id');
+
+    // To handle stock adjustments accurately during edit
+    const [originalItems, setOriginalItems] = useState<any[]>([]);
 
     // Database State
     const [vendors, setVendors] = useState<any[]>([]);
@@ -57,6 +65,9 @@ export default function PurchaseEntry() {
     const [paymentDueDate, setPaymentDueDate] = useState("");
     const [isVendorDropdownOpen, setIsVendorDropdownOpen] = useState(false);
     const vendorRef = useRef<HTMLDivElement>(null);
+
+    // Validation State
+    const [validationErrors, setValidationErrors] = useState<Record<string, boolean>>({});
 
     // Line items state
     const [items, setItems] = useState<PurchaseItem[]>([
@@ -80,6 +91,39 @@ export default function PurchaseEntry() {
 
                 if (vendorsRes.data) setVendors(vendorsRes.data);
                 if (productsRes.data) setAllProducts(productsRes.data);
+
+                // Fetch Edit Data if needed
+                if (isEdit && editId) {
+                    const { data: purchase, error: pErr } = await supabase
+                        .from('purchases')
+                        .select('*, purchase_items(*)')
+                        .eq('id', editId)
+                        .single();
+
+                    if (purchase) {
+                        setVendorId(purchase.vendor_id);
+                        setBillNumber(purchase.bill_number);
+                        setPurchaseDate(purchase.purchase_date);
+                        setOverallDiscount(purchase.overall_discount);
+                        setPayLater(purchase.is_credit);
+                        setPaymentDueDate(purchase.due_date || "");
+
+                        const mappedItems = purchase.purchase_items.map((item: any) => ({
+                            id: item.id.toString(),
+                            productId: item.product_id.toString(),
+                            batchCode: item.batch_code,
+                            expiryDate: item.expiry_date,
+                            quantity: item.quantity,
+                            freeQuantity: item.free_quantity,
+                            purchasePrice: item.purchase_price,
+                            mrp: item.mrp,
+                            unitValue: item.unit_value,
+                            unitType: item.unit_type
+                        }));
+                        setItems(mappedItems);
+                        setOriginalItems(purchase.purchase_items);
+                    }
+                }
             } catch (err) {
                 console.error("Fetch error:", err);
             } finally {
@@ -87,7 +131,7 @@ export default function PurchaseEntry() {
             }
         };
         fetchInitialData();
-    }, []);
+    }, [isEdit, editId]);
 
     const addRow = () => {
         setItems([...items, { id: Math.random().toString(), productId: "", batchCode: "", expiryDate: "", quantity: 0, freeQuantity: 0, purchasePrice: 0, mrp: 0, unitValue: "", unitType: "" }]);
@@ -156,53 +200,124 @@ export default function PurchaseEntry() {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!vendorId || !billNumber) {
-            alert("Please select a vendor and enter a bill number.");
+        setValidationErrors({});
+
+        // 1. Validation
+        const errors: Record<string, boolean> = {};
+        if (!vendorId) errors['vendor'] = true;
+        if (!billNumber) errors['billNumber'] = true;
+        if (payLater && !paymentDueDate) errors['paymentDueDate'] = true;
+
+        const validItems = items.filter(i => i.productId);
+        if (validItems.length === 0) {
+            alert("Please add at least one product to the purchase.");
             return;
         }
+
+        validItems.forEach(i => {
+            if (!i.batchCode) errors[`${i.id}-batchCode`] = true;
+            if (!i.expiryDate) errors[`${i.id}-expiryDate`] = true;
+            if (i.quantity <= 0) errors[`${i.id}-quantity`] = true;
+            if (i.purchasePrice <= 0) errors[`${i.id}-purchasePrice`] = true;
+            if (i.mrp <= 0) errors[`${i.id}-mrp`] = true;
+        });
+
+        if (Object.keys(errors).length > 0) {
+            setValidationErrors(errors);
+            alert("Please fill all highlighted fields with valid data.");
+            return;
+        }
+
         setIsSubmitting(true);
 
-        const { data: purchase, error: purchaseError } = await supabase
-            .from('purchases')
-            .insert([{
-                vendor_id: parseInt(vendorId.toString()),
-                bill_number: billNumber,
-                purchase_date: purchaseDate,
-                overall_discount: overallDiscount,
-                total_amount: totals.numericGrandTotal,
-                is_credit: payLater,
-                due_date: payLater ? paymentDueDate : null
-            }])
-            .select()
-            .single();
+        try {
+            let purchaseId: any;
 
-        if (purchaseError) {
-            alert("Header Error: " + purchaseError.message);
-            setIsSubmitting(false);
-            return;
-        }
+            if (isEdit && editId) {
+                // RECONCILIATION: Reverse old stock
+                for (const oldItem of originalItems) {
+                    const { data: product } = await supabase.from('products').select('current_stock, unit_value').eq('id', oldItem.product_id).single();
+                    if (product) {
+                        const unitFactor = parseFloat(product.unit_value) || 1;
+                        const oldStockAdd = (parseFloat(oldItem.quantity) + parseFloat(oldItem.free_quantity || 0)) * unitFactor;
+                        await supabase.from('products').update({ current_stock: parseFloat(product.current_stock) - oldStockAdd }).eq('id', oldItem.product_id);
+                    }
+                }
 
-        const lineItems = items.filter(i => i.productId).map(item => ({
-            purchase_id: purchase.id,
-            product_id: parseInt(item.productId),
-            batch_code: item.batchCode,
-            expiry_date: item.expiryDate, // Use the correct property from PurchaseItem interface
-            quantity: item.quantity,
-            free_quantity: item.freeQuantity,
-            purchase_price: item.purchasePrice,
-            mrp: item.mrp,
-            unit_value: item.unitValue,
-            unit_type: item.unitType
-        }));
+                // Update Header
+                const { error: headerErr } = await supabase
+                    .from('purchases')
+                    .update({
+                        vendor_id: parseInt(vendorId.toString()),
+                        bill_number: billNumber,
+                        purchase_date: purchaseDate,
+                        overall_discount: overallDiscount,
+                        total_amount: totals.numericGrandTotal,
+                        is_credit: payLater,
+                        due_date: payLater ? paymentDueDate : null
+                    })
+                    .eq('id', editId);
 
-        const { error: itemsError } = await supabase.from('purchase_items').insert(lineItems);
+                if (headerErr) throw headerErr;
+                purchaseId = editId;
 
-        if (!itemsError) {
+                // Delete Old Items
+                await supabase.from('purchase_items').delete().eq('purchase_id', editId);
+            } else {
+                // Create New Header
+                const { data: purchase, error: purchaseError } = await supabase
+                    .from('purchases')
+                    .insert([{
+                        vendor_id: parseInt(vendorId.toString()),
+                        bill_number: billNumber,
+                        purchase_date: purchaseDate,
+                        overall_discount: overallDiscount,
+                        total_amount: totals.numericGrandTotal,
+                        is_credit: payLater,
+                        due_date: payLater ? paymentDueDate : null
+                    }])
+                    .select()
+                    .single();
+
+                if (purchaseError) throw purchaseError;
+                purchaseId = purchase.id;
+            }
+
+            // 2. Prepare & Insert Line Items
+            const lineItems = items.filter(i => i.productId).map(item => ({
+                purchase_id: purchaseId,
+                product_id: parseInt(item.productId),
+                batch_code: item.batchCode,
+                expiry_date: item.expiryDate,
+                quantity: item.quantity,
+                free_quantity: item.freeQuantity || 0,
+                purchase_price: item.purchasePrice,
+                mrp: item.mrp,
+                unit_value: item.unitValue,
+                unit_type: item.unitType
+            }));
+
+            const { error: itemsError } = await supabase.from('purchase_items').insert(lineItems);
+            if (itemsError) throw itemsError;
+
+            // 4. Update Product Stock Levels (Manual Sync)
+            for (const item of lineItems) {
+                const { data: product } = await supabase.from('products').select('current_stock, unit_value').eq('id', item.product_id).single();
+                if (product) {
+                    const unitFactor = parseFloat(product.unit_value) || 1;
+                    const addedStock = (parseFloat(item.quantity.toString()) + parseFloat(item.free_quantity.toString())) * unitFactor;
+                    const newStock = (parseFloat(product.current_stock || 0)) + addedStock;
+                    await supabase.from('products').update({ current_stock: newStock }).eq('id', item.product_id);
+                }
+            }
+
             setIsSuccess(true);
-        } else {
-            alert("Line Item Error: " + itemsError.message);
+        } catch (err: any) {
+            console.error("Submission Error:", err);
+            alert(err.message);
+        } finally {
+            setIsSubmitting(false);
         }
-        setIsSubmitting(false);
     };
 
     if (isLoading) {
@@ -245,7 +360,10 @@ export default function PurchaseEntry() {
                                     <button
                                         type="button"
                                         onClick={() => setIsVendorDropdownOpen(!isVendorDropdownOpen)}
-                                        className="w-full h-9 px-3 bg-gray-50 border border-gray-100 rounded-xl flex items-center justify-between hover:bg-white transition-all shadow-sm"
+                                        className={cn(
+                                            "w-full h-9 px-3 bg-gray-50 border rounded-xl flex items-center justify-between hover:bg-white transition-all shadow-sm",
+                                            validationErrors['vendor'] ? "border-red-500 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100"
+                                        )}
                                     >
                                         {selectedVendor ? (
                                             <div className="flex items-center gap-2">
@@ -292,7 +410,18 @@ export default function PurchaseEntry() {
                                     <label className="text-[9px] font-black text-gray-400 uppercase tracking-widest px-1">Bill Reference</label>
                                     <div className="relative">
                                         <Hash className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-300" size={11} />
-                                        <input value={billNumber} onChange={(e) => setBillNumber(e.target.value)} placeholder="0000" className="w-full h-9 pl-7 pr-3 bg-gray-50 border border-gray-100 rounded-xl outline-none font-black text-[12px] shadow-sm focus:bg-white focus:border-indigo-200 transition-all" />
+                                        <input
+                                            value={billNumber}
+                                            onChange={(e) => {
+                                                setBillNumber(e.target.value);
+                                                if (validationErrors['billNumber']) setValidationErrors(prev => ({ ...prev, billNumber: false }));
+                                            }}
+                                            placeholder="0000"
+                                            className={cn(
+                                                "w-full h-9 pl-7 pr-3 bg-gray-50 border rounded-xl outline-none font-black text-[12px] shadow-sm focus:bg-white transition-all",
+                                                validationErrors['billNumber'] ? "border-red-500 focus:border-red-500 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100 focus:border-indigo-200"
+                                            )}
+                                        />
                                     </div>
                                 </div>
 
@@ -303,6 +432,41 @@ export default function PurchaseEntry() {
                                         <input type="date" value={purchaseDate} onChange={(e) => setPurchaseDate(e.target.value)} className="w-full h-9 pl-7 pr-3 bg-gray-50 border border-gray-100 rounded-xl font-black text-[11px] shadow-sm outline-none cursor-pointer" />
                                     </div>
                                 </div>
+
+                                <div className="h-9 flex items-center gap-2 px-3 bg-gray-50 rounded-xl border border-gray-100">
+                                    <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest">Credit Entry</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => setPayLater(!payLater)}
+                                        className={cn(
+                                            "w-10 h-5 rounded-full relative transition-all",
+                                            payLater ? "bg-amber-500" : "bg-gray-200"
+                                        )}
+                                    >
+                                        <div className={cn(
+                                            "absolute top-1 w-3 h-3 bg-white rounded-full transition-all",
+                                            payLater ? "left-6" : "left-1"
+                                        )} />
+                                    </button>
+                                </div>
+
+                                {payLater && (
+                                    <div className="w-40 space-y-1">
+                                        <label className="text-[9px] font-black text-amber-500 uppercase tracking-widest px-1">Payment Due Date</label>
+                                        <div className="relative">
+                                            <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 text-amber-300" size={11} />
+                                            <input
+                                                type="date"
+                                                value={paymentDueDate}
+                                                onChange={(e) => setPaymentDueDate(e.target.value)}
+                                                className={cn(
+                                                    "w-full h-9 pl-7 pr-3 bg-amber-50 border rounded-xl font-black text-[11px] shadow-sm outline-none cursor-pointer text-amber-700",
+                                                    validationErrors['paymentDueDate'] ? "border-red-500" : "border-amber-100"
+                                                )}
+                                            />
+                                        </div>
+                                    </div>
+                                )}
 
                                 <div className="bg-gray-900 rounded-xl px-5 h-9 flex items-center justify-center gap-4 ml-auto shadow-lg">
                                     <span className="text-[9px] font-black text-gray-400 uppercase tracking-[2px]">Net Payable</span>
@@ -403,10 +567,32 @@ export default function PurchaseEntry() {
                                                             </div>
                                                         </td>
                                                         <td className="py-2 px-2">
-                                                            <input value={item.batchCode} onChange={(e) => updateItem(item.id, 'batchCode', e.target.value)} placeholder="Batch" className="w-full h-8 bg-gray-50 border border-gray-100 rounded-xl px-2 text-center font-black text-[11px] uppercase outline-none focus:bg-white" />
+                                                            <input
+                                                                value={item.batchCode}
+                                                                onChange={(e) => {
+                                                                    updateItem(item.id, 'batchCode', e.target.value);
+                                                                    if (validationErrors[`${item.id}-batchCode`]) setValidationErrors(prev => ({ ...prev, [`${item.id}-batchCode`]: false }));
+                                                                }}
+                                                                placeholder="Batch"
+                                                                className={cn(
+                                                                    "w-full h-8 bg-gray-50 border rounded-xl px-2 text-center font-black text-[11px] uppercase outline-none focus:bg-white",
+                                                                    validationErrors[`${item.id}-batchCode`] ? "border-red-500 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100"
+                                                                )}
+                                                            />
                                                         </td>
                                                         <td className="py-2 px-2">
-                                                            <input type="date" value={item.expiryDate} onChange={(e) => updateItem(item.id, 'expiryDate', e.target.value)} className="w-full h-8 bg-gray-50 border border-gray-100 rounded-xl px-1 text-[10px] font-black outline-none cursor-pointer focus:bg-white" />
+                                                            <input
+                                                                type="date"
+                                                                value={item.expiryDate}
+                                                                onChange={(e) => {
+                                                                    updateItem(item.id, 'expiryDate', e.target.value);
+                                                                    if (validationErrors[`${item.id}-expiryDate`]) setValidationErrors(prev => ({ ...prev, [`${item.id}-expiryDate`]: false }));
+                                                                }}
+                                                                className={cn(
+                                                                    "w-full h-8 bg-gray-50 border rounded-xl px-1 text-[10px] font-black outline-none cursor-pointer focus:bg-white",
+                                                                    validationErrors[`${item.id}-expiryDate`] ? "border-red-500 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100"
+                                                                )}
+                                                            />
                                                         </td>
                                                         <td className="py-2 px-2">
                                                             <input
@@ -414,8 +600,15 @@ export default function PurchaseEntry() {
                                                                 onWheel={disableScrollOnNumberInput}
                                                                 value={item.quantity || ""}
                                                                 placeholder="0"
-                                                                onChange={(e) => updateItem(item.id, 'quantity', parseFloat(e.target.value) || 0)}
-                                                                className="w-full h-8 border border-gray-100 rounded-xl text-center font-black text-[12px] outline-none hover:border-indigo-600 transition-all focus:ring-2 focus:ring-indigo-100"
+                                                                onChange={(e) => {
+                                                                    const val = parseFloat(e.target.value) || 0;
+                                                                    updateItem(item.id, 'quantity', val);
+                                                                    if (val > 0 && validationErrors[`${item.id}-quantity`]) setValidationErrors(prev => ({ ...prev, [`${item.id}-quantity`]: false }));
+                                                                }}
+                                                                className={cn(
+                                                                    "w-full h-8 border rounded-xl text-center font-black text-[12px] outline-none transition-all focus:ring-2",
+                                                                    validationErrors[`${item.id}-quantity`] ? "border-red-500 ring-red-100 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100 hover:border-indigo-600 focus:ring-indigo-100"
+                                                                )}
                                                             />
                                                         </td>
                                                         <td className="py-2 px-2">
@@ -434,8 +627,15 @@ export default function PurchaseEntry() {
                                                                 onWheel={disableScrollOnNumberInput}
                                                                 value={item.purchasePrice || ""}
                                                                 placeholder="0.00"
-                                                                onChange={(e) => updateItem(item.id, 'purchasePrice', parseFloat(e.target.value) || 0)}
-                                                                className="w-full h-8 border border-gray-100 rounded-xl text-right px-2 font-black text-[12px] text-indigo-600 outline-none"
+                                                                onChange={(e) => {
+                                                                    const val = parseFloat(e.target.value) || 0;
+                                                                    updateItem(item.id, 'purchasePrice', val);
+                                                                    if (val > 0 && validationErrors[`${item.id}-purchasePrice`]) setValidationErrors(prev => ({ ...prev, [`${item.id}-purchasePrice`]: false }));
+                                                                }}
+                                                                className={cn(
+                                                                    "w-full h-8 border rounded-xl text-right px-2 font-black text-[12px] text-indigo-600 outline-none",
+                                                                    validationErrors[`${item.id}-purchasePrice`] ? "border-red-500 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100"
+                                                                )}
                                                             />
                                                         </td>
                                                         <td className="py-2 px-2">
@@ -444,8 +644,15 @@ export default function PurchaseEntry() {
                                                                 onWheel={disableScrollOnNumberInput}
                                                                 value={item.mrp || ""}
                                                                 placeholder="0.00"
-                                                                onChange={(e) => updateItem(item.id, 'mrp', parseFloat(e.target.value) || 0)}
-                                                                className="w-full h-8 border border-gray-100 rounded-xl text-right px-2 font-black text-[12px] text-orange-600 outline-none"
+                                                                onChange={(e) => {
+                                                                    const val = parseFloat(e.target.value) || 0;
+                                                                    updateItem(item.id, 'mrp', val);
+                                                                    if (val > 0 && validationErrors[`${item.id}-mrp`]) setValidationErrors(prev => ({ ...prev, [`${item.id}-mrp`]: false }));
+                                                                }}
+                                                                className={cn(
+                                                                    "w-full h-8 border rounded-xl text-right px-2 font-black text-[12px] text-orange-600 outline-none",
+                                                                    validationErrors[`${item.id}-mrp`] ? "border-red-500 shadow-[0_0_0_2px_rgba(239,68,68,0.1)]" : "border-gray-100"
+                                                                )}
                                                             />
                                                         </td>
                                                         <td className="py-2 px-5 text-right font-black text-[12px] tabular-nums text-gray-900">Rs.{(item.quantity * item.purchasePrice).toFixed(2)}</td>
@@ -505,11 +712,13 @@ export default function PurchaseEntry() {
                         <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-white rounded-[40px] p-24 flex flex-col items-center text-center shadow-2xl relative overflow-hidden mt-10">
                             <div className="absolute top-0 inset-x-0 h-1.5 bg-emerald-500" />
                             <div className="w-20 h-20 bg-emerald-50 rounded-2xl flex items-center justify-center mb-8 border border-emerald-100 shadow-lg shadow-emerald-50"><Check size={40} className="text-emerald-500" strokeWidth={3} /></div>
-                            <h2 className="text-3xl font-black text-gray-900 mb-2 tracking-tighter">Acquisition Synchronized</h2>
-                            <p className="text-[12px] font-bold text-gray-400 uppercase tracking-[3px] mb-10 max-w-sm leading-relaxed">The physical stock labels and batch identities have been reconciled with the global registry.</p>
+                            <h2 className="text-3xl font-black text-gray-900 mb-2 tracking-tighter">{isEdit ? "Acquisition Updated" : "Acquisition Synchronized"}</h2>
+                            <p className="text-[12px] font-bold text-gray-400 uppercase tracking-[3px] mb-10 max-w-sm leading-relaxed">{isEdit ? "The ledger and inventory levels have been reconciled." : "The physical stock labels and batch identities have been reconciled with the global registry."}</p>
                             <div className="flex gap-3">
-                                <button onClick={() => { setIsSuccess(false); setVendorId(""); setItems([{ id: Math.random().toString(), productId: "", batchCode: "", expiryDate: "", quantity: 0, freeQuantity: 0, purchasePrice: 0, mrp: 0, unitValue: "", unitType: "" }]); }} className="h-12 px-10 border-2 border-gray-100 rounded-2xl font-black text-[10px] uppercase tracking-[2px] text-gray-400 hover:text-gray-900 transition-all">New Entry</button>
-                                <Link href="/" className="h-12 px-10 bg-gray-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-[2px] flex items-center justify-center shadow-lg hover:bg-indigo-600 transition-all">Dashboard</Link>
+                                <button onClick={() => { setIsSuccess(false); setVendorId(""); setItems([{ id: Math.random().toString(), productId: "", batchCode: "", expiryDate: "", quantity: 0, freeQuantity: 0, purchasePrice: 0, mrp: 0, unitValue: "", unitType: "" }]); if (isEdit) router.push('/purchase-entry'); }} className="h-12 px-10 border-2 border-gray-100 rounded-2xl font-black text-[10px] uppercase tracking-[2px] text-gray-400 hover:text-gray-900 transition-all">
+                                    {isEdit ? "New Entry" : "Add Another"}
+                                </button>
+                                <Link href="/purchases" className="h-12 px-10 bg-gray-900 text-white rounded-2xl font-black text-[10px] uppercase tracking-[2px] flex items-center justify-center shadow-lg hover:bg-indigo-600 transition-all">Back to Ledger</Link>
                             </div>
                         </motion.div>
                     )}

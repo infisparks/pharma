@@ -15,11 +15,14 @@ import {
     ShoppingBag,
     SearchX,
     Loader2,
-    Wallet
+    Wallet,
+    Layers,
+    ChevronDown as ChevronDownIcon
 } from "lucide-react";
 import { cn, disableScrollOnNumberInput } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { createClient } from "@/utils/supabase/client";
+import { useSearchParams } from "next/navigation";
 
 interface CartItem {
     cartId: string;
@@ -53,6 +56,11 @@ export default function SellPage() {
     const [newCustomerPhone, setNewCustomerPhone] = useState("");
     const [doctorId, setDoctorId] = useState("");
     const [isCustomerDropdownOpen, setIsCustomerDropdownOpen] = useState(false);
+    const [openBatchSelector, setOpenBatchSelector] = useState<string | null>(null);
+
+    const searchParams = useSearchParams();
+    const isEdit = searchParams.get('type') === 'edit';
+    const editId = searchParams.get('id');
 
     // Cart State
     const [searchQuery, setSearchQuery] = useState("");
@@ -62,6 +70,8 @@ export default function SellPage() {
     const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'Online' | 'Mixed'>('Cash');
     const [cashAmount, setCashAmount] = useState(0);
     const [onlineAmount, setOnlineAmount] = useState(0);
+    const [doctorName, setDoctorName] = useState("");
+    const [notes, setNotes] = useState("");
 
     const customerRef = useRef<HTMLDivElement>(null);
     const searchRef = useRef<HTMLDivElement>(null);
@@ -72,7 +82,7 @@ export default function SellPage() {
             supabase.from('customers').select('*').order('name'),
             supabase.from('products').select('*').order('name'),
             supabase.from('purchase_items').select('*'),
-            supabase.from('sale_items').select('product_id, batch_code, quantity')
+            supabase.from('sale_items').select('sale_id, product_id, batch_code, quantity')
         ]);
         if (custRes.data) setCustomers(custRes.data);
         if (prodRes.data) setAllProducts(prodRes.data);
@@ -90,6 +100,10 @@ export default function SellPage() {
 
         // Subtract sold quantities
         (salesRes.data || []).forEach(si => {
+            // CRITICAL: When editing a sale, we should NOT subtract the items of the sale we are currently editing
+            // derived from the shop's total inventory. This ensures that the user can "re-buy" the items they already have.
+            if (isEdit && String(si.sale_id) === String(editId)) return;
+
             const key = `${si.product_id}_${si.batch_code}`;
             const product = prodRes.data?.find(p => p.id === si.product_id);
             const unitValue = parseFloat(product?.unit_value || 1);
@@ -115,6 +129,56 @@ export default function SellPage() {
             });
 
         setStocks(stocksArray);
+
+        // If Edit Mode, fetch sale details
+        if (isEdit && editId) {
+            const { data: sale, error: saleErr } = await supabase
+                .from('sales')
+                .select(`
+                    *,
+                    customers (*),
+                    sale_items (
+                        *,
+                        products (*)
+                    )
+                `)
+                .eq('id', editId)
+                .single();
+
+            if (sale && !saleErr) {
+                setCustomerId(sale.customer_id || "");
+                setNewCustomerName(sale.customers?.name || "Walk-in Customer");
+                setNewCustomerPhone(sale.customers?.phone || "");
+                setPaymentMethod(sale.payment_method);
+                setCashAmount(parseFloat(sale.cash_amount) || 0);
+                setOnlineAmount(parseFloat(sale.online_amount) || 0);
+                setOverallDiscount(parseFloat(sale.discount_amount) || 0);
+                setDoctorName(sale.doctor_name || "");
+                setNotes(sale.notes || "");
+
+                const mappedCart = sale.sale_items.map((item: any) => {
+                    const product = item.products;
+                    const stockInfo = stocksArray.find(s => s.product_id === item.product_id && s.batch_code === item.batch_code);
+                    const unitValue = product?.unit_value || 1;
+
+                    return {
+                        cartId: Math.random().toString(),
+                        id: item.product_id.toString(),
+                        name: product?.name || "Unknown",
+                        emoji: product?.emoji || "📦",
+                        category: product?.category || "General",
+                        unit_value: unitValue,
+                        unit_type: product?.unit_type || "Pack",
+                        mrp: parseFloat(item.unit_price) || 0,
+                        batchCode: item.batch_code,
+                        qty: parseFloat(item.quantity) || 0,
+                        expiryDate: stockInfo?.expiry_date || "",
+                        maxQty: Math.floor((stockInfo?.quantity || 0) / unitValue)
+                    };
+                });
+                setCart(mappedCart);
+            }
+        }
         setIsLoading(false);
     };
 
@@ -145,6 +209,16 @@ export default function SellPage() {
             })
             .sort((a, b) => (b.availableStock > 0 ? 1 : 0) - (a.availableStock > 0 ? 1 : 0));
     }, [searchQuery, allProducts, stocks]);
+
+    const filteredCustomers = useMemo(() => {
+        const query = newCustomerName.toLowerCase().trim();
+        const phoneQuery = newCustomerPhone.trim();
+        if (!query && !phoneQuery) return [];
+        return customers.filter(c =>
+            (query && c.name?.toLowerCase().includes(query)) ||
+            (phoneQuery && c.phone?.includes(phoneQuery))
+        );
+    }, [newCustomerName, newCustomerPhone, customers]);
 
     const addToCart = (product: any) => {
         // Find stock for this product (oldest batch first)
@@ -216,6 +290,25 @@ export default function SellPage() {
         }));
     };
 
+    const switchBatch = (cartId: string, newBatch: any) => {
+        setCart(cart.map(item => {
+            if (item.cartId === cartId) {
+                const unitValue = item.unit_value || 1;
+                const maxPacks = Math.floor((newBatch.quantity || 0) / unitValue);
+                return {
+                    ...item,
+                    batchCode: newBatch.batch_code,
+                    expiryDate: newBatch.expiry_date,
+                    mrp: newBatch.mrp,
+                    maxQty: maxPacks,
+                    qty: Math.min(item.qty, maxPacks)
+                };
+            }
+            return item;
+        }));
+        setOpenBatchSelector(null);
+    };
+
     const totals = useMemo(() => {
         const subtotal = cart.reduce((acc, item) => acc + (item.mrp * item.qty), 0);
         const grandTotal = Math.max(0, subtotal - overallDiscount);
@@ -239,29 +332,66 @@ export default function SellPage() {
         try {
             // 1. Handle Customer
             let finalCustomerId = customerId;
-            if (!customerId) {
+
+            if (!finalCustomerId && newCustomerName) {
                 const { data: newCust, error: custErr } = await supabase
                     .from('customers')
                     .insert([{ name: newCustomerName, phone: newCustomerPhone }])
-                    .select().single();
+                    .select()
+                    .single();
+
+                if (custErr) throw new Error("Customer Creation Error: " + custErr.message);
                 if (newCust) finalCustomerId = newCust.id;
             }
 
-            // 2. Create Sale Header
-            const { data: sale, error: saleErr } = await supabase
-                .from('sales')
-                .insert([{
-                    customer_id: finalCustomerId || null,
-                    total_amount: totals.grandTotal,
-                    discount_amount: overallDiscount,
-                    payment_method: paymentMethod,
-                    cash_amount: paymentMethod === 'Online' ? 0 : cashAmount,
-                    online_amount: paymentMethod === 'Cash' ? 0 : onlineAmount,
-                    doctor_name: doctorId
-                }])
-                .select().single();
+            // 2. Create/Update Sale Header
+            let sale;
+            if (isEdit && editId) {
+                const { data: updatedSale, error: saleErr } = await supabase
+                    .from('sales')
+                    .update([{
+                        customer_id: finalCustomerId ? (typeof finalCustomerId === 'string' ? parseInt(finalCustomerId) : finalCustomerId) : null,
+                        total_amount: totals.grandTotal,
+                        discount_amount: overallDiscount,
+                        payment_method: paymentMethod,
+                        cash_amount: paymentMethod === 'Online' ? 0 : cashAmount,
+                        online_amount: paymentMethod === 'Cash' ? 0 : onlineAmount,
+                        doctor_name: doctorName,
+                        notes: notes
+                    }])
+                    .eq('id', editId)
+                    .select().single();
 
-            if (saleErr) throw saleErr;
+                if (saleErr) throw saleErr;
+                sale = updatedSale;
+
+                // Delete old items to replace them
+                const { error: delErr } = await supabase
+                    .from('sale_items')
+                    .delete()
+                    .eq('sale_id', editId);
+
+                if (delErr) throw delErr;
+            } else {
+                const { data: newSale, error: saleErr } = await supabase
+                    .from('sales')
+                    .insert([{
+                        customer_id: finalCustomerId ? (typeof finalCustomerId === 'string' ? parseInt(finalCustomerId) : finalCustomerId) : null,
+                        total_amount: totals.grandTotal,
+                        discount_amount: overallDiscount,
+                        payment_method: paymentMethod,
+                        cash_amount: paymentMethod === 'Online' ? 0 : cashAmount,
+                        online_amount: paymentMethod === 'Cash' ? 0 : onlineAmount,
+                        doctor_name: doctorName,
+                        notes: notes
+                    }])
+                    .select().single();
+
+                if (saleErr) throw saleErr;
+                sale = newSale;
+            }
+
+            if (!sale) throw new Error("Sale header was created but not returned by the system.");
 
             // 3. Process Items (Stock is calculated in real-time from sale_items)
             for (const item of cart) {
@@ -282,6 +412,9 @@ export default function SellPage() {
             setCashAmount(0);
             setOnlineAmount(0);
             setOverallDiscount(0);
+            setDoctorName("");
+            setNotes("");
+            setCustomerId("");
             await loadData(); // Refresh stock
         } catch (err: any) {
             alert("Sale Failed: " + err.message);
@@ -299,28 +432,94 @@ export default function SellPage() {
                 <div className="flex-1 flex flex-col bg-white rounded-[32px] border border-gray-100 shadow-sm overflow-hidden relative">
                     <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between bg-white relative z-10">
                         <div className="flex items-center gap-3">
-                            <div className="w-10 h-10 rounded-2xl bg-gray-900 flex items-center justify-center text-white shadow-lg">
-                                <ShoppingCart size={18} />
+                            <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center transition-all", isEdit ? "bg-amber-100 text-amber-600" : "bg-indigo-100 text-indigo-600")}>
+                                <ShoppingBag size={20} strokeWidth={2.5} />
                             </div>
                             <div>
-                                <h2 className="text-[10px] font-black text-gray-400 uppercase tracking-[2px] leading-none mb-1">POS Protocol v3.0</h2>
-                                <p className="text-[16px] font-black text-gray-800 tracking-tight">Sales Terminal</p>
+                                <h1 className="text-xl font-black text-gray-900 leading-none mb-1">
+                                    {isEdit ? "Edit Transaction" : "New Transaction"}
+                                </h1>
+                                <p className="text-[10px] font-bold text-gray-400 uppercase tracking-[2px]">Terminal POS v2.0</p>
                             </div>
                         </div>
 
                         <div className="flex items-center gap-2 relative" ref={customerRef}>
-                            <div className="flex flex-col gap-1 items-end">
+                            <div className="flex flex-col gap-1 items-end relative">
                                 <input
                                     value={newCustomerName}
-                                    onChange={(e) => { setNewCustomerName(e.target.value); setIsCustomerDropdownOpen(true); }}
+                                    onFocus={() => setIsCustomerDropdownOpen(true)}
+                                    onChange={(e) => {
+                                        setNewCustomerName(e.target.value);
+                                        setCustomerId(""); // Reset ID if user types a new name
+                                        setIsCustomerDropdownOpen(true);
+                                    }}
                                     placeholder="Customer Name *"
                                     className="h-9 px-4 bg-gray-50 border border-transparent rounded-xl focus:bg-white focus:border-indigo-100 outline-none font-bold text-[13px] w-48 transition-all"
                                 />
+
+                                <AnimatePresence>
+                                    {isCustomerDropdownOpen && (newCustomerName || newCustomerPhone) && (
+                                        <motion.div
+                                            initial={{ opacity: 0, y: 5 }}
+                                            animate={{ opacity: 1, y: 0 }}
+                                            exit={{ opacity: 0, y: 5 }}
+                                            className="absolute top-full mt-2 w-64 bg-white border border-gray-100 rounded-2xl shadow-2xl z-[160] overflow-hidden"
+                                        >
+                                            <div className="max-h-64 overflow-y-auto p-1.5 flex flex-col gap-1">
+                                                {filteredCustomers.length > 0 && (
+                                                    <>
+                                                        <div className="px-3 py-1 text-[9px] font-black text-gray-400 uppercase tracking-widest">Matched Records</div>
+                                                        {filteredCustomers.map(c => (
+                                                            <button
+                                                                key={c.id}
+                                                                type="button"
+                                                                onClick={() => {
+                                                                    setCustomerId(c.id);
+                                                                    setNewCustomerName(c.name);
+                                                                    setNewCustomerPhone(c.phone || "");
+                                                                    setIsCustomerDropdownOpen(false);
+                                                                }}
+                                                                className="flex items-center justify-between p-2.5 rounded-xl hover:bg-indigo-50 transition-all text-left group"
+                                                            >
+                                                                <div>
+                                                                    <div className="text-[12px] font-black text-gray-800 leading-none mb-1">{c.name}</div>
+                                                                    <div className="text-[10px] font-bold text-indigo-600 uppercase tracking-tight">{c.phone || 'No Phone'}</div>
+                                                                </div>
+                                                                <div className="w-6 h-6 rounded-lg bg-gray-50 flex items-center justify-center text-gray-300 group-hover:bg-indigo-600 group-hover:text-white transition-all">
+                                                                    <ArrowRight size={12} />
+                                                                </div>
+                                                            </button>
+                                                        ))}
+                                                        <div className="h-[1px] bg-gray-50 my-1 mx-2" />
+                                                    </>
+                                                )}
+
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setIsCustomerDropdownOpen(false)}
+                                                    className="flex items-center gap-3 p-3 rounded-xl bg-gray-900 text-white hover:bg-indigo-600 transition-all text-left shadow-lg group"
+                                                >
+                                                    <div className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center group-hover:scale-110 transition-transform">
+                                                        <Plus size={14} strokeWidth={3} />
+                                                    </div>
+                                                    <div>
+                                                        <div className="text-[11px] font-black uppercase tracking-wider">Register New Profile</div>
+                                                        <div className="text-[9px] font-bold text-gray-400 group-hover:text-indigo-200">Will record as new entity</div>
+                                                    </div>
+                                                </button>
+                                            </div>
+                                        </motion.div>
+                                    )}
+                                </AnimatePresence>
+
                                 <div className="flex items-center gap-2">
                                     <Phone size={10} className="text-gray-300" />
                                     <input
                                         value={newCustomerPhone}
-                                        onChange={(e) => setNewCustomerPhone(e.target.value)}
+                                        onChange={(e) => {
+                                            setNewCustomerPhone(e.target.value);
+                                            setIsCustomerDropdownOpen(true);
+                                        }}
                                         placeholder="Phone"
                                         className="h-6 bg-transparent outline-none font-bold text-[10px] w-36 text-gray-400"
                                     />
@@ -339,10 +538,57 @@ export default function SellPage() {
                             <motion.div layout key={item.cartId} initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }} className="p-4 bg-white border border-gray-100 rounded-[24px] shadow-sm flex items-center justify-between group hover:border-indigo-100 transition-all border-l-4 border-l-indigo-600">
                                 <div className="flex items-center gap-4">
                                     <div className="w-12 h-12 rounded-2xl bg-gray-50 flex items-center justify-center text-2xl shadow-inner">{item.emoji}</div>
-                                    <div>
+                                    <div className="relative">
                                         <h4 className="text-[15px] font-black text-gray-900 leading-none mb-1">{item.name}</h4>
-                                        <div className="text-[11px] font-bold text-gray-400 uppercase tracking-widest flex items-center gap-2">
-                                            Batch: {item.batchCode} <span className="w-1 h-1 bg-gray-200 rounded-full" /> Exp: {item.expiryDate}
+                                        <div className="flex flex-col gap-1">
+                                            <button
+                                                onClick={() => setOpenBatchSelector(openBatchSelector === item.cartId ? null : item.cartId)}
+                                                className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest flex items-center gap-2 hover:bg-indigo-50 px-2 py-0.5 rounded-lg border border-transparent hover:border-indigo-100 transition-all w-fit"
+                                            >
+                                                <Layers size={10} />
+                                                Batch: {item.batchCode} <span className="w-1 h-1 bg-gray-300 rounded-full" /> Exp: {item.expiryDate}
+                                                <ChevronDownIcon size={10} className={cn("transition-transform", openBatchSelector === item.cartId && "rotate-180")} />
+                                            </button>
+
+                                            <AnimatePresence>
+                                                {openBatchSelector === item.cartId && (
+                                                    <motion.div
+                                                        initial={{ opacity: 0, y: -10 }}
+                                                        animate={{ opacity: 1, y: 0 }}
+                                                        exit={{ opacity: 0, y: -10 }}
+                                                        className="absolute top-full left-0 mt-2 bg-white border border-gray-100 rounded-2xl shadow-xl z-50 p-2 min-w-[240px]"
+                                                    >
+                                                        <div className="text-[9px] font-black text-gray-400 uppercase tracking-widest px-2 mb-2">Available Batches</div>
+                                                        <div className="space-y-1">
+                                                            {stocks
+                                                                .filter(s => s.product_id === item.id)
+                                                                .sort((a, b) => new Date(b.expiry_date).getTime() - new Date(a.expiry_date).getTime()) // Newest first
+                                                                .map(batch => (
+                                                                    <button
+                                                                        key={batch.batch_code}
+                                                                        onClick={() => switchBatch(item.cartId, batch)}
+                                                                        className={cn(
+                                                                            "w-full text-left p-2 rounded-xl transition-all flex items-center justify-between group",
+                                                                            item.batchCode === batch.batch_code ? "bg-indigo-50 border border-indigo-100" : "hover:bg-gray-50"
+                                                                        )}
+                                                                    >
+                                                                        <div>
+                                                                            <div className="text-[11px] font-black text-gray-800">{batch.batch_code}</div>
+                                                                            <div className="text-[9px] font-bold text-gray-400 uppercase">Exp: {batch.expiry_date}</div>
+                                                                        </div>
+                                                                        <div className="text-right">
+                                                                            <div className="text-[10px] font-black text-gray-800">Rs.{batch.mrp}</div>
+                                                                            <div className="text-[9px] font-bold text-emerald-600 uppercase tracking-tighter">
+                                                                                {Math.floor(batch.quantity / (item.unit_value || 1))} Packs
+                                                                            </div>
+                                                                        </div>
+                                                                    </button>
+                                                                ))
+                                                            }
+                                                        </div>
+                                                    </motion.div>
+                                                )}
+                                            </AnimatePresence>
                                         </div>
                                     </div>
                                 </div>
@@ -476,6 +722,28 @@ export default function SellPage() {
                             <div className="space-y-1">
                                 <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Optional Discount</span>
                                 <input type="number" onWheel={disableScrollOnNumberInput} value={overallDiscount || ""} onChange={(e) => setOverallDiscount(parseFloat(e.target.value) || 0)} className="w-full h-10 px-4 bg-gray-50 border border-transparent rounded-xl font-black text-[14px] outline-none" placeholder="Rs. 0.00" />
+                            </div>
+
+                            <div className="space-y-4 pt-2 border-t border-gray-50">
+                                <div className="space-y-1">
+                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Doctor Name</span>
+                                    <input
+                                        value={doctorName}
+                                        onChange={(e) => setDoctorName(e.target.value)}
+                                        className="w-full h-10 px-4 bg-gray-50 border border-transparent rounded-xl font-bold text-[13px] outline-none focus:bg-white focus:border-indigo-100 transition-all"
+                                        placeholder="Prescribing Physician..."
+                                    />
+                                </div>
+                                <div className="space-y-1">
+                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-1">Internal Notes</span>
+                                    <textarea
+                                        value={notes}
+                                        onChange={(e) => setNotes(e.target.value)}
+                                        rows={3}
+                                        className="w-full p-4 bg-gray-50 border border-transparent rounded-2xl font-bold text-[12px] outline-none focus:bg-white focus:border-indigo-100 transition-all resize-none leading-relaxed text-gray-600"
+                                        placeholder="Add professional observations or transaction notes here..."
+                                    />
+                                </div>
                             </div>
 
                             <button onClick={executeSale} disabled={isSubmitting || cart.length === 0} className="w-full h-16 bg-gray-900 text-white rounded-[28px] font-black text-[13px] uppercase tracking-[3px] flex items-center justify-center gap-3 hover:bg-indigo-600 transition-all shadow-xl active:scale-95 disabled:opacity-20 mt-4">

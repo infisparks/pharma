@@ -1,8 +1,7 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { TopBar } from "@/components/TopBar";
-import { mockPurchases, PurchaseRecord, PurchaseItem } from "@/data/purchases";
 import {
     Search,
     ChevronDown,
@@ -21,35 +20,107 @@ import {
     Tag,
     History,
     Edit3,
-    ArrowRight
+    ArrowRight,
+    Loader2
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
+import { createClient } from "@/utils/supabase/client";
+import Link from "next/link";
 
 export default function PurchaseLedger() {
     const [searchQuery, setSearchQuery] = useState("");
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
-    const [purchases, setPurchases] = useState<PurchaseRecord[]>(mockPurchases);
+    const [purchases, setPurchases] = useState<any[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const supabase = createClient();
 
-    const filteredPurchases = useMemo(() => {
-        return purchases.filter(p =>
-            p.vendorName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            p.billNumber.toLowerCase().includes(searchQuery.toLowerCase())
-        );
-    }, [searchQuery, purchases]);
+    useEffect(() => {
+        fetchPurchases();
+    }, []);
 
-    const updateStatus = (id: string, newStatus: 'Paid' | 'Unpaid') => {
-        setPurchases(prev => prev.map(p => p.id === id ? { ...p, status: newStatus } : p));
+    const fetchPurchases = async () => {
+        setIsLoading(true);
+        try {
+            const { data, error } = await supabase
+                .from('purchases')
+                .select(`
+                    *,
+                    vendors (
+                        full_name,
+                        business_name
+                    ),
+                    purchase_items (
+                        id,
+                        product_id,
+                        batch_code,
+                        expiry_date,
+                        quantity,
+                        free_quantity,
+                        purchase_price,
+                        mrp,
+                        unit_value,
+                        unit_type,
+                        products (
+                            name,
+                            emoji
+                        )
+                    )
+                `)
+                .order('purchase_date', { ascending: false });
+
+            if (error) throw error;
+            setPurchases(data || []);
+        } catch (error) {
+            console.error("Error fetching purchases:", error);
+        } finally {
+            setIsLoading(false);
+        }
     };
 
-    const updateDiscount = (id: string, newDiscount: number) => {
-        setPurchases(prev => prev.map(p => {
-            if (p.id === id) {
-                const grandTotal = Math.max(0, p.subtotal - newDiscount);
-                return { ...p, overallDiscount: newDiscount, grandTotal };
-            }
-            return p;
-        }));
+    const filteredPurchases = useMemo(() => {
+        return purchases.filter(p => {
+            const vendorName = p.vendors?.business_name || p.vendors?.full_name || "";
+            return vendorName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                p.bill_number.toLowerCase().includes(searchQuery.toLowerCase());
+        });
+    }, [searchQuery, purchases]);
+
+    const updateStatus = async (id: string, isCredit: boolean) => {
+        try {
+            const { error } = await supabase
+                .from('purchases')
+                .update({ is_credit: isCredit })
+                .eq('id', id);
+
+            if (error) throw error;
+            fetchPurchases();
+        } catch (error) {
+            console.error("Error updating status:", error);
+        }
+    };
+
+    const updateDiscount = async (id: string, newDiscount: number) => {
+        const purchase = purchases.find(p => p.id === id);
+        if (!purchase) return;
+
+        const subtotal = purchase.purchase_items.reduce((acc: number, item: any) => acc + (item.quantity * item.purchase_price), 0);
+        const grandTotal = Math.max(0, subtotal - newDiscount);
+
+        try {
+            const { error } = await supabase
+                .from('purchases')
+                .update({
+                    overall_discount: newDiscount,
+                    total_amount: grandTotal
+                })
+                .eq('id', id);
+
+            if (error) throw error;
+            fetchPurchases();
+        } catch (error) {
+            console.error("Error updating discount:", error);
+        }
     };
 
     return (
@@ -86,17 +157,25 @@ export default function PurchaseLedger() {
 
                 {/* Ledger Listing */}
                 <div className="space-y-4">
-                    {filteredPurchases.map((purchase) => {
+                    {isLoading ? (
+                        <div className="flex flex-col items-center justify-center py-20 gap-4">
+                            <Loader2 className="animate-spin text-indigo-600" size={32} />
+                            <span className="text-[10px] font-black uppercase tracking-[3px] text-gray-400">Synchronizing Ledger</span>
+                        </div>
+                    ) : filteredPurchases.map((purchase) => {
                         const isExpanded = expandedRow === purchase.id;
-                        const isOverdue = purchase.payLater && purchase.paymentDueDate && new Date() > new Date(purchase.paymentDueDate) && purchase.status !== 'Paid';
+                        const isOverdue = purchase.is_credit && purchase.due_date && new Date() > new Date(purchase.due_date);
+                        const vendorName = purchase.vendors?.business_name || purchase.vendors?.full_name || "Unknown Vendor";
 
                         // Calculate days remaining or delayed
                         let dayDiff = 0;
-                        if (purchase.paymentDueDate) {
+                        if (purchase.due_date) {
                             const today = new Date();
-                            const due = new Date(purchase.paymentDueDate);
+                            const due = new Date(purchase.due_date);
                             dayDiff = Math.ceil((due.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
                         }
+
+                        const subtotal = purchase.purchase_items?.reduce((acc: number, item: any) => acc + (item.quantity * item.purchase_price), 0) || 0;
 
                         return (
                             <div key={purchase.id} className="group">
@@ -109,7 +188,7 @@ export default function PurchaseLedger() {
                                     {/* Critical Status Bar */}
                                     <div className={cn(
                                         "h-1.5 w-full",
-                                        purchase.status === 'Paid' ? "bg-emerald-500" : (isOverdue ? "bg-red-500" : "bg-amber-400")
+                                        !purchase.is_credit ? "bg-emerald-500" : (isOverdue ? "bg-red-500" : "bg-amber-400")
                                     )} />
 
                                     <div className="p-6 md:p-8 flex flex-col md:flex-row items-start md:items-center justify-between gap-8">
@@ -119,18 +198,18 @@ export default function PurchaseLedger() {
                                             </div>
                                             <div>
                                                 <div className="flex items-center gap-3 mb-1.5">
-                                                    <h3 className="text-lg font-black text-gray-900 tracking-tight">{purchase.vendorName}</h3>
-                                                    <span className="text-[10px] font-black text-indigo-500 bg-indigo-50 px-2.5 py-1 rounded-full uppercase tracking-widest">{purchase.billNumber}</span>
+                                                    <h3 className="text-lg font-black text-gray-900 tracking-tight">{vendorName}</h3>
+                                                    <span className="text-[10px] font-black text-indigo-500 bg-indigo-50 px-2.5 py-1 rounded-full uppercase tracking-widest">{purchase.bill_number}</span>
                                                 </div>
                                                 <div className="flex items-center gap-4">
                                                     <div className="flex items-center gap-1.5">
                                                         <Calendar size={12} className="text-gray-400" />
-                                                        <span className="text-[11px] font-bold text-gray-400">{purchase.purchaseDate}</span>
+                                                        <span className="text-[11px] font-bold text-gray-400">{purchase.purchase_date}</span>
                                                     </div>
                                                     <div className="h-3 w-[1px] bg-gray-200" />
                                                     <div className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wider text-gray-800">
                                                         <Package size={12} className="text-indigo-400" />
-                                                        {purchase.items.length} Items
+                                                        {purchase.purchase_items?.length || 0} Items
                                                     </div>
                                                 </div>
                                             </div>
@@ -138,7 +217,7 @@ export default function PurchaseLedger() {
 
                                         <div className="flex items-center gap-10">
                                             {/* Payment Timeline */}
-                                            {purchase.payLater && (
+                                            {purchase.is_credit && (
                                                 <div className="text-right">
                                                     <div className="flex items-center justify-end gap-2 mb-1">
                                                         <Clock size={12} className={isOverdue ? "text-red-500 animate-pulse" : "text-amber-500"} />
@@ -146,10 +225,10 @@ export default function PurchaseLedger() {
                                                             "text-[10px] font-black uppercase tracking-widest",
                                                             isOverdue ? "text-red-500" : "text-amber-500"
                                                         )}>
-                                                            {purchase.status === 'Paid' ? "Cycle Complete" : (isOverdue ? "Delayed Entry" : `${dayDiff} Days Remaining`)}
+                                                            {isOverdue ? "Delayed Entry" : `${dayDiff} Days Remaining`}
                                                         </span>
                                                     </div>
-                                                    <div className="text-[13px] font-black text-gray-800 tabular-nums">Due: {purchase.paymentDueDate}</div>
+                                                    <div className="text-[13px] font-black text-gray-800 tabular-nums">Due: {purchase.due_date}</div>
                                                 </div>
                                             )}
 
@@ -157,8 +236,15 @@ export default function PurchaseLedger() {
 
                                             <div className="text-right">
                                                 <span className="text-[10px] font-black text-gray-400 uppercase tracking-[3px] block mb-1">Final Payable</span>
-                                                <div className="text-2xl font-black text-gray-900 tabular-nums">Rs.{purchase.grandTotal.toLocaleString()}</div>
+                                                <div className="text-2xl font-black text-gray-900 tabular-nums">Rs.{purchase.total_amount?.toLocaleString()}</div>
                                             </div>
+
+                                            <Link
+                                                href={`/purchase-entry?type=edit&id=${purchase.id}`}
+                                                className="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center hover:bg-indigo-600 hover:text-white transition-all shadow-sm group/edit"
+                                            >
+                                                <Edit3 size={18} strokeWidth={3} className="group-hover/edit:scale-110 transition-transform" />
+                                            </Link>
 
                                             <button
                                                 onClick={() => setExpandedRow(isExpanded ? null : purchase.id)}
@@ -193,40 +279,47 @@ export default function PurchaseLedger() {
                                                         </div>
 
                                                         <div className="bg-white rounded-[24px] border border-gray-100 shadow-sm overflow-hidden">
-                                                            <table className="w-full">
-                                                                <thead>
-                                                                    <tr className="bg-gray-50/50 text-left border-b border-gray-50">
-                                                                        <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest">Product</th>
-                                                                        <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-center">Batch</th>
-                                                                        <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-center">Qty x Price</th>
-                                                                        <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-right">Row Total</th>
-                                                                        <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-center">Expiry</th>
-                                                                    </tr>
-                                                                </thead>
-                                                                <tbody>
-                                                                    {purchase.items.map((item) => (
-                                                                        <tr key={item.id} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/30 transition-colors">
-                                                                            <td className="py-5 px-6">
-                                                                                <div className="text-[13px] font-black text-gray-900">{item.productName}</div>
-                                                                                <div className="text-[9px] font-bold text-gray-400">Master Record Unique Identity</div>
-                                                                            </td>
-                                                                            <td className="py-5 px-6 text-center">
-                                                                                <span className="px-2.5 py-1 bg-gray-50 border border-gray-100 rounded-lg text-[10px] font-black text-gray-600 uppercase tracking-widest">{item.batchCode}</span>
-                                                                            </td>
-                                                                            <td className="py-5 px-6 text-center">
-                                                                                <div className="text-[12px] font-black text-gray-700">{item.quantity} units <span className="text-gray-300 mx-1">@</span> Rs.{item.purchasePrice}</div>
-                                                                                {item.freeQuantity > 0 && <div className="text-[9px] font-black text-emerald-500 uppercase tracking-tighter">+{item.freeQuantity} Free stock</div>}
-                                                                            </td>
-                                                                            <td className="py-5 px-6 text-right font-black text-gray-900 tabular-nums text-[13px]">
-                                                                                Rs.{(item.quantity * item.purchasePrice).toLocaleString()}
-                                                                            </td>
-                                                                            <td className="py-5 px-6 text-center">
-                                                                                <span className="text-[11px] font-black text-indigo-900 bg-indigo-50 px-3 py-1 rounded-full">{item.expiryDate}</span>
-                                                                            </td>
+                                                            <div className="overflow-x-auto">
+                                                                <table className="w-full">
+                                                                    <thead>
+                                                                        <tr className="bg-gray-50/50 text-left border-b border-gray-50">
+                                                                            <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest">Product</th>
+                                                                            <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-center">Batch</th>
+                                                                            <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-center">Qty x Price</th>
+                                                                            <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-right">Row Total</th>
+                                                                            <th className="py-4 px-6 text-[9px] font-black text-gray-400 uppercase tracking-widest text-center">Expiry</th>
                                                                         </tr>
-                                                                    ))}
-                                                                </tbody>
-                                                            </table>
+                                                                    </thead>
+                                                                    <tbody>
+                                                                        {purchase.purchase_items?.map((item: any) => (
+                                                                            <tr key={item.id} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/30 transition-colors">
+                                                                                <td className="py-5 px-6">
+                                                                                    <div className="flex items-center gap-3">
+                                                                                        <div className="w-8 h-8 bg-gray-50 rounded-lg flex items-center justify-center text-sm">{item.products?.emoji || '📦'}</div>
+                                                                                        <div>
+                                                                                            <div className="text-[13px] font-black text-gray-900">{item.products?.name}</div>
+                                                                                            <div className="text-[9px] font-bold text-gray-400 uppercase tracking-tight">{item.unit_value} {item.unit_type}</div>
+                                                                                        </div>
+                                                                                    </div>
+                                                                                </td>
+                                                                                <td className="py-5 px-6 text-center">
+                                                                                    <span className="px-2.5 py-1 bg-gray-50 border border-gray-100 rounded-lg text-[10px] font-black text-gray-600 uppercase tracking-widest">{item.batch_code}</span>
+                                                                                </td>
+                                                                                <td className="py-5 px-6 text-center">
+                                                                                    <div className="text-[12px] font-black text-gray-700">{item.quantity} units <span className="text-gray-300 mx-1">@</span> Rs.{item.purchase_price}</div>
+                                                                                    {item.free_quantity > 0 && <div className="text-[9px] font-black text-emerald-500 uppercase tracking-tighter">+{item.free_quantity} Free stock</div>}
+                                                                                </td>
+                                                                                <td className="py-5 px-6 text-right font-black text-gray-900 tabular-nums text-[13px]">
+                                                                                    Rs.{(item.quantity * item.purchase_price).toLocaleString()}
+                                                                                </td>
+                                                                                <td className="py-5 px-6 text-center">
+                                                                                    <span className="text-[11px] font-black text-indigo-900 bg-indigo-50 px-3 py-1 rounded-full">{item.expiry_date}</span>
+                                                                                </td>
+                                                                            </tr>
+                                                                        ))}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
                                                         </div>
                                                     </div>
 
@@ -243,7 +336,7 @@ export default function PurchaseLedger() {
                                                                     <div className="absolute left-4 top-1/2 -translate-y-1/2 text-[11px] font-black text-indigo-400 uppercase tracking-widest">LESS Rs.</div>
                                                                     <input
                                                                         type="number"
-                                                                        value={purchase.overallDiscount}
+                                                                        value={purchase.overall_discount}
                                                                         onChange={(e) => updateDiscount(purchase.id, parseFloat(e.target.value) || 0)}
                                                                         className="w-full h-14 pl-24 pr-6 bg-indigo-50/30 border border-transparent rounded-2xl focus:bg-white focus:border-indigo-100 outline-none font-black text-indigo-600 tabular-nums text-lg transition-all"
                                                                     />
@@ -256,20 +349,20 @@ export default function PurchaseLedger() {
                                                                 <label className="text-[10px] font-black text-gray-900 uppercase tracking-[2px] block mb-6">Settlement Status</label>
                                                                 <div className="flex bg-gray-50 p-1.5 rounded-2xl border border-gray-100">
                                                                     <button
-                                                                        onClick={() => updateStatus(purchase.id, 'Paid')}
+                                                                        onClick={() => updateStatus(purchase.id, false)}
                                                                         className={cn(
                                                                             "flex-1 h-12 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all gap-2 flex items-center justify-center",
-                                                                            purchase.status === 'Paid' ? "bg-white text-emerald-600 shadow-md border border-emerald-50" : "text-gray-400 hover:bg-white"
+                                                                            !purchase.is_credit ? "bg-white text-emerald-600 shadow-md border border-emerald-50" : "text-gray-400 hover:bg-white"
                                                                         )}
                                                                     >
                                                                         <CheckCircle2 size={14} />
                                                                         SETTLED
                                                                     </button>
                                                                     <button
-                                                                        onClick={() => updateStatus(purchase.id, 'Unpaid')}
+                                                                        onClick={() => updateStatus(purchase.id, true)}
                                                                         className={cn(
                                                                             "flex-1 h-12 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all gap-2 flex items-center justify-center",
-                                                                            purchase.status !== 'Paid' ? "bg-white text-amber-600 shadow-md border border-amber-50" : "text-gray-400 hover:bg-white"
+                                                                            purchase.is_credit ? "bg-white text-amber-600 shadow-md border border-amber-50" : "text-gray-400 hover:bg-white"
                                                                         )}
                                                                     >
                                                                         <AlertCircle size={14} />
@@ -294,23 +387,23 @@ export default function PurchaseLedger() {
                                                                 <div className="space-y-4">
                                                                     <div className="flex items-center justify-between">
                                                                         <span className="text-[11px] font-bold text-gray-400">Invoice Amount</span>
-                                                                        <span className="text-[14px] font-black tabular-nums">Rs.{purchase.subtotal.toLocaleString()}</span>
+                                                                        <span className="text-[14px] font-black tabular-nums">Rs.{subtotal.toLocaleString()}</span>
                                                                     </div>
                                                                     <div className="flex items-center justify-between text-indigo-400">
                                                                         <span className="text-[11px] font-bold">Adjusted Discount</span>
-                                                                        <span className="text-[14px] font-black tabular-nums">- Rs.{purchase.overallDiscount.toLocaleString()}</span>
+                                                                        <span className="text-[14px] font-black tabular-nums">- Rs.{purchase.overall_discount?.toLocaleString()}</span>
                                                                     </div>
                                                                     <div className="h-[1px] bg-white/10 my-4" />
                                                                     <div className="flex items-center justify-between">
                                                                         <span className="text-[12px] font-black uppercase tracking-widest">NET PAYABLE</span>
-                                                                        <span className="text-3xl font-black text-emerald-400 tabular-nums tracking-tighter">Rs.{purchase.grandTotal.toLocaleString()}</span>
+                                                                        <span className="text-3xl font-black text-emerald-400 tabular-nums tracking-tighter">Rs.{purchase.total_amount?.toLocaleString()}</span>
                                                                     </div>
                                                                 </div>
                                                             </div>
 
                                                             <div className="relative z-10 pt-4">
-                                                                <button className="w-full h-14 bg-emerald-500 hover:bg-emerald-600 text-white rounded-2xl font-black text-[12px] uppercase tracking-[3px] transition-all active:scale-95 flex items-center justify-center gap-3">
-                                                                    Save Analysis
+                                                                <button onClick={() => setExpandedRow(null)} className="w-full h-14 bg-emerald-500 hover:bg-emerald-600 text-white rounded-2xl font-black text-[12px] uppercase tracking-[3px] transition-all active:scale-95 flex items-center justify-center gap-3">
+                                                                    Done
                                                                     <ArrowRight size={18} strokeWidth={3} />
                                                                 </button>
                                                             </div>
